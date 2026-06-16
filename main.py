@@ -15,9 +15,9 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "data", "tasks.db")
 
 # ===== 账号配置（修改密码在这里改） =====
 ACCOUNTS = {
-    "admin1": {"password": "admin123@yy", "role": "admin1"},
-    "admin2": {"password": "admin456@yy", "role": "admin2"},
-    "admin3": {"password": "admin123@yy", "role": "admin3"},
+    "admin1": {"password": "admin123@yy", "role": "admin"},
+    "admin2": {"password": "admin456@yy", "role": "admin"},
+    "admin3": {"password": "admin123@yy", "role": "viewer"},
 }
 
 # 简易 token 存储：{token: {user, role, created_at}}
