@@ -1,16 +1,66 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 import sqlite3
 import os
+import hashlib
+import secrets
+import time
 
 app = FastAPI()
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "tasks.db")
 
-# 初始化数据库
+# ===== 账号配置（修改密码在这里改） =====
+ACCOUNTS = {
+    "admin1": {"password": "admin123", "role": "admin"},
+    "admin2": {"password": "admin456", "role": "admin"},
+    "viewer": {"password": "viewer123", "role": "viewer"},
+}
+
+# 简易 token 存储：{token: {user, role, created_at}}
+sessions = {}
+
+def clean_expired():
+    now = time.time()
+    expired = [k for k, v in sessions.items() if now - v["created_at"] > 86400]  # 24h过期
+    for k in expired:
+        del sessions[k]
+
+class LoginReq(BaseModel):
+    username: str
+    password: str
+
+@app.post("/api/login")
+def login(req: LoginReq):
+    account = ACCOUNTS.get(req.username)
+    if not account or account["password"] != req.password:
+        raise HTTPException(status_code=401, detail="账号或密码错误")
+    clean_expired()
+    token = secrets.token_hex(32)
+    sessions[token] = {"user": req.username, "role": account["role"], "created_at": time.time()}
+    return {"token": token, "role": account["role"], "user": req.username}
+
+def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未登录")
+    token = authorization[7:]
+    session = sessions.get(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+    if time.time() - session["created_at"] > 86400:
+        del sessions[token]
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+    return session
+
+def require_admin(user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="无编辑权限，请使用管理员账号")
+    return user
+
+# ===== 数据库 =====
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -24,21 +74,24 @@ def init_db():
             user TEXT DEFAULT '待填写',
             status TEXT DEFAULT '进行中',
             trigger TEXT DEFAULT '',
+            push TEXT DEFAULT '',
             note TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # 写入示例数据（仅首次）
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+    if 'push' not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN push TEXT DEFAULT ''")
     count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     if count == 0:
         sample = [
-            ('次日转化', '1197', '未付费用户', '激活', '新用户', '进行中', '未支付且首登48小时以上且未付费', ''),
-            ('H5用户-连麦【付费-5分钟未转化】', '', '未付费用户', '转化', '快手渠道-新用户', '已结束', '首登48小时内收听解答后5分钟内未支付', ''),
-            ('商店-连麦【免费转付费-3分钟】', '', '未付费用户', '转化', '商店渠道-新用户', '进行中', '免费连麦后3分钟未进行付费连麦', ''),
-            ('小红书app用户促转化运营策略2', '1161', '未付费用户', '激活', '小红书渠道-新用户', '进行中', '首登后3分钟内未支付', ''),
+            ('次日转化', '1197', '未付费用户', '首单激活', '新用户', '进行中', '未支付且首登48小时以上且未付费', '', ''),
+            ('H5用户-连麦【付费-5分钟未转化】', '', '未付费用户', '付费转化', '快手渠道-新用户', '已结束', '首登48小时内收听解答后5分钟内未支付', '', ''),
+            ('商店-连麦【免费转付费-3分钟】', '', '未付费用户', '付费转化', '商店渠道-新用户', '进行中', '免费连麦后3分钟未进行付费连麦', '', ''),
+            ('小红书app用户促转化运营策略2', '1161', '未付费用户', '首单激活', '小红书渠道-新用户', '进行中', '首登后3分钟内未支付', '', ''),
         ]
         conn.executemany(
-            "INSERT INTO tasks (name,tid,stage,goal,user,status,trigger,note) VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO tasks (name,tid,stage,goal,user,status,trigger,push,note) VALUES (?,?,?,?,?,?,?,?,?)",
             sample
         )
     conn.commit()
@@ -51,7 +104,6 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
-# 数据模型
 class TaskIn(BaseModel):
     name: str
     tid: Optional[str] = ''
@@ -60,6 +112,7 @@ class TaskIn(BaseModel):
     user: Optional[str] = '待填写'
     status: Optional[str] = '进行中'
     trigger: Optional[str] = ''
+    push: Optional[str] = ''
     note: Optional[str] = ''
 
 class TaskUpdate(BaseModel):
@@ -70,22 +123,23 @@ class TaskUpdate(BaseModel):
     user: Optional[str] = None
     status: Optional[str] = None
     trigger: Optional[str] = None
+    push: Optional[str] = None
     note: Optional[str] = None
 
-# API 路由
+# ===== API（查看需登录，编辑需管理员） =====
 @app.get("/api/tasks")
-def list_tasks():
+def list_tasks(user=Depends(get_current_user)):
     conn = get_db()
     rows = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.post("/api/tasks")
-def create_task(task: TaskIn):
+def create_task(task: TaskIn, user=Depends(require_admin)):
     conn = get_db()
     cur = conn.execute(
-        "INSERT INTO tasks (name,tid,stage,goal,user,status,trigger,note) VALUES (?,?,?,?,?,?,?,?)",
-        (task.name, task.tid, task.stage, task.goal, task.user, task.status, task.trigger, task.note)
+        "INSERT INTO tasks (name,tid,stage,goal,user,status,trigger,push,note) VALUES (?,?,?,?,?,?,?,?,?)",
+        (task.name, task.tid, task.stage, task.goal, task.user, task.status, task.trigger, task.push, task.note)
     )
     conn.commit()
     row = conn.execute("SELECT * FROM tasks WHERE id=?", (cur.lastrowid,)).fetchone()
@@ -93,7 +147,7 @@ def create_task(task: TaskIn):
     return dict(row)
 
 @app.put("/api/tasks/{task_id}")
-def update_task(task_id: int, task: TaskUpdate):
+def update_task(task_id: int, task: TaskUpdate, user=Depends(require_admin)):
     conn = get_db()
     existing = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     if not existing:
@@ -109,7 +163,7 @@ def update_task(task_id: int, task: TaskUpdate):
     return dict(row)
 
 @app.delete("/api/tasks/{task_id}")
-def delete_task(task_id: int):
+def delete_task(task_id: int, user=Depends(require_admin)):
     conn = get_db()
     conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
     conn.commit()
@@ -117,21 +171,21 @@ def delete_task(task_id: int):
     return {"ok": True}
 
 @app.post("/api/tasks/batch")
-def batch_import(tasks: list[TaskIn]):
+def batch_import(tasks: list[TaskIn], user=Depends(require_admin)):
     conn = get_db()
     added, updated = 0, 0
     for t in tasks:
         existing = conn.execute("SELECT id FROM tasks WHERE name=?", (t.name,)).fetchone()
         if existing:
             conn.execute(
-                "UPDATE tasks SET tid=?,stage=?,goal=?,user=?,status=?,trigger=?,note=? WHERE id=?",
-                (t.tid, t.stage, t.goal, t.user, t.status, t.trigger, t.note, existing['id'])
+                "UPDATE tasks SET tid=?,stage=?,goal=?,user=?,status=?,trigger=?,push=?,note=? WHERE id=?",
+                (t.tid, t.stage, t.goal, t.user, t.status, t.trigger, t.push, t.note, existing['id'])
             )
             updated += 1
         else:
             conn.execute(
-                "INSERT INTO tasks (name,tid,stage,goal,user,status,trigger,note) VALUES (?,?,?,?,?,?,?,?)",
-                (t.name, t.tid, t.stage, t.goal, t.user, t.status, t.trigger, t.note)
+                "INSERT INTO tasks (name,tid,stage,goal,user,status,trigger,push,note) VALUES (?,?,?,?,?,?,?,?,?)",
+                (t.name, t.tid, t.stage, t.goal, t.user, t.status, t.trigger, t.push, t.note)
             )
             added += 1
     conn.commit()
